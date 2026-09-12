@@ -10,9 +10,9 @@ const wss = new WebSocket.Server({ server });
 app.use(express.json());
 
 // -------------------------------------------------------------
-// In-Memory Storage (Replace with DB connections in production)
+// In-Memory Database Storage
 // -------------------------------------------------------------
-const users = []; // { id, email, password, balance, resetToken, resetExpiry }
+const users = []; // Stores { id, email, password, balance, resetToken, resetExpiry }
 const trades = [];
 const transactions = [];
 
@@ -26,14 +26,14 @@ const markets = {
   '1HZ10V':{ name: 'Volatility 10 (1s) Index', price: 1510.90, vol: 0.15, history: [] }
 };
 
-// Real-Time Synthetic Market Data Generator
+// Real-Time Synthetic Market Data Generator Engine
 setInterval(() => {
   Object.keys(markets).forEach(symbol => {
     const m = markets[symbol];
     const delta = (Math.random() - 0.498) * m.vol * 8;
     m.price = parseFloat((m.price + delta).toFixed(2));
     
-    // Extract last digit for digit-based trading
+    // Extract last digit for digit-based trading ring
     const priceStr = m.price.toFixed(2);
     const lastDigit = parseInt(priceStr.slice(-1), 10);
 
@@ -62,9 +62,15 @@ function broadcastMarketTicks() {
 // -------------------------------------------------------------
 app.post('/api/auth/register', (req, res) => {
   const { email, password } = req.body;
-  if (users.find(u => u.email === email)) {
-    return res.status(400).json({ error: "Email already registered. Please login." });
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
   }
+
+  const existingUser = users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  if (existingUser) {
+    return res.status(400).json({ error: "Email already registered. Please click 'Log In'." });
+  }
+
   const newUser = { id: 'USR-' + Date.now(), email, password, balance: 1000.00 };
   users.push(newUser);
   res.json({ success: true, user: { id: newUser.id, email: newUser.email, balance: newUser.balance } });
@@ -72,26 +78,29 @@ app.post('/api/auth/register', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
-  const user = users.find(u => u.email === email && u.password === password);
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+
+  const user = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password === password);
   if (!user) {
-    return res.status(401).json({ error: "Invalid credentials. Email or password does not match." });
+    return res.status(401).json({ error: "Invalid credentials. Incorrect email or password." });
   }
   res.json({ success: true, user: { id: user.id, email: user.email, balance: user.balance } });
 });
 
 app.post('/api/auth/recover-request', (req, res) => {
   const { email } = req.body;
-  const user = users.find(u => u.email === email);
+  const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
   if (!user) {
     return res.status(404).json({ error: "Email account not found." });
   }
   
   const token = crypto.randomBytes(20).toString('hex');
   user.resetToken = token;
-  user.resetExpiry = Date.now() + 3600000; // 1 hour validity
+  user.resetExpiry = Date.now() + 3600000; // 1 hour token validity
 
-  // In production, integrate NodeMailer/SendGrid here to send real emails.
-  res.json({ success: true, message: "Recovery email dispatched.", resetToken: token });
+  res.json({ success: true, message: "Recovery token dispatched.", resetToken: token });
 });
 
 app.post('/api/auth/reset-password', (req, res) => {
@@ -104,11 +113,11 @@ app.post('/api/auth/reset-password', (req, res) => {
   user.password = newPassword;
   user.resetToken = null;
   user.resetExpiry = null;
-  res.json({ success: true, message: "Password reset successful. You may now log in." });
+  res.json({ success: true, message: "Password reset successful. You can now log in." });
 });
 
 // -------------------------------------------------------------
-// 3. AI DEEP SCAN MARKET ANALYZER
+// 2. AI DEEP SCAN MARKET ANALYZER
 // -------------------------------------------------------------
 app.get('/api/ai/deep-scan', (req, res) => {
   let bestMarket = null;
@@ -133,7 +142,6 @@ app.get('/api/ai/deep-scan', (req, res) => {
     digits.forEach(d => digitCounts[d]++);
     const maxDigitFreq = Math.max(...digitCounts);
 
-    // Calculate AI Score based on trend consistency and digit variance
     const score = Math.min(99, Math.floor(Math.abs(momentum) * 400 + maxDigitFreq * 8 + Math.random() * 10));
 
     analysisReport[symbol] = {
@@ -158,17 +166,17 @@ app.get('/api/ai/deep-scan', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 4. TRADING ENGINE (MANUAL & AUTOMATED)
+// 3. TRADING ENGINE (MANUAL & AUTOMATED)
 // -------------------------------------------------------------
 app.post('/api/trade/execute', (req, res) => {
   const { userId, symbol, tradeType, stake, durationSeconds, targetDigit, mode } = req.body;
   const user = users.find(u => u.id === userId);
   
-  if (!user) return res.status(404).json({ error: "User profile not found" });
-  if (user.balance < stake) return res.status(400).json({ error: "Insufficient wallet balance" });
+  if (!user) return res.status(404).json({ error: "User profile not found. Please login." });
+  if (user.balance < stake) return res.status(400).json({ error: "Insufficient wallet balance." });
 
   const market = markets[symbol];
-  if (!market) return res.status(400).json({ error: "Invalid market symbol selected" });
+  if (!market) return res.status(400).json({ error: "Invalid market symbol selected." });
 
   user.balance -= stake;
 
@@ -192,7 +200,7 @@ app.post('/api/trade/execute', (req, res) => {
 
   trades.push(trade);
 
-  // Settle trade after chosen duration
+  // Settle trade after duration
   setTimeout(() => {
     const exitPrice = markets[symbol].price;
     const exitDigit = parseInt(exitPrice.toFixed(2).slice(-1), 10);
@@ -203,7 +211,7 @@ app.post('/api/trade/execute', (req, res) => {
     else if (tradeType === 'FALL') win = exitPrice < entryPrice;
     else if (tradeType === 'MATCH_DIGIT') {
       win = exitDigit === trade.targetDigit;
-      payoutMultiplier = 8.0; // Higher reward for digit matching
+      payoutMultiplier = 8.0;
     } else if (tradeType === 'DIFF_DIGIT') {
       win = exitDigit !== trade.targetDigit;
       payoutMultiplier = 0.10;
@@ -222,7 +230,7 @@ app.post('/api/trade/execute', (req, res) => {
       trade.payout = 0;
     }
 
-    // Broadcast update to client
+    // Broadcast result to user over WebSocket
     const updatePayload = JSON.stringify({ type: 'TRADE_SETTLED', trade, balance: user.balance });
     wss.clients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) client.send(updatePayload);
@@ -234,15 +242,15 @@ app.post('/api/trade/execute', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 5. DEPOSITS & WITHDRAWALS
+// 4. DEPOSITS & WITHDRAWALS
 // -------------------------------------------------------------
 app.post('/api/wallet/deposit', (req, res) => {
   const { userId, amount, paymentMethod } = req.body;
   const user = users.find(u => u.id === userId);
-  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user) return res.status(404).json({ error: "User profile not found." });
 
   const numAmount = parseFloat(amount);
-  if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: "Invalid deposit amount" });
+  if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: "Invalid deposit amount." });
 
   user.balance += numAmount;
 
@@ -263,10 +271,10 @@ app.post('/api/wallet/deposit', (req, res) => {
 app.post('/api/wallet/withdraw', (req, res) => {
   const { userId, amount, accountDetails } = req.body;
   const user = users.find(u => u.id === userId);
-  if (!user) return res.status(404).json({ error: "User not found" });
+  if (!user) return res.status(404).json({ error: "User profile not found." });
 
   const numAmount = parseFloat(amount);
-  if (user.balance < numAmount) return res.status(400).json({ error: "Insufficient balance for withdrawal" });
+  if (user.balance < numAmount) return res.status(400).json({ error: "Insufficient wallet balance." });
 
   user.balance -= numAmount;
 
@@ -281,11 +289,11 @@ app.post('/api/wallet/withdraw', (req, res) => {
   };
   transactions.push(txn);
 
-  res.json({ success: true, message: "Withdrawal request executed.", balance: user.balance, transaction: txn });
+  res.json({ success: true, message: "Withdrawal executed successfully.", balance: user.balance, transaction: txn });
 });
 
 // -------------------------------------------------------------
-// FRONTEND INTERFACE DASHBOARD (Single Page Application)
+// FRONTEND INTERFACE DASHBOARD
 // -------------------------------------------------------------
 app.get('/', (req, res) => {
   res.send(`
@@ -336,7 +344,7 @@ app.get('/', (req, res) => {
     <div class="bg-gray-900 border border-gray-800 w-full max-w-md rounded-xl p-6 shadow-2xl">
       <h2 id="authTitle" class="text-2xl font-black text-red-500 mb-6 text-center">DERIV LOGIN</h2>
       
-      <!-- Login / Register Form -->
+      <!-- Form Input Controls -->
       <div id="mainAuthForm" class="space-y-4">
         <div>
           <label class="block text-xs text-gray-400 mb-1">Email Address</label>
@@ -346,7 +354,7 @@ app.get('/', (req, res) => {
           <label class="block text-xs text-gray-400 mb-1">Password</label>
           <input id="authPassword" type="password" placeholder="••••••••" class="w-full bg-gray-950 border border-gray-800 rounded p-2 text-sm focus:outline-none focus:border-red-500">
         </div>
-        <button id="authSubmitBtn" onclick="submitAuth('LOGIN')" class="w-full bg-red-600 hover:bg-red-500 py-2.5 rounded font-bold text-sm">Log In</button>
+        <button id="authSubmitBtn" onclick="submitAuth()" class="w-full bg-red-600 hover:bg-red-500 py-2.5 rounded font-bold text-sm">Log In</button>
         
         <div class="flex justify-between items-center text-xs text-gray-400 mt-4">
           <button onclick="toggleAuthMode()" id="authToggleBtn" class="hover:underline text-blue-400">Need an account? Register</button>
@@ -356,7 +364,7 @@ app.get('/', (req, res) => {
 
       <!-- Password Recovery Form -->
       <div id="recoveryForm" class="space-y-4 hidden">
-        <p class="text-xs text-gray-400">Enter your email address to receive a recovery token.</p>
+        <p class="text-xs text-gray-400">Enter your account email to generate a recovery token.</p>
         <div>
           <label class="block text-xs text-gray-400 mb-1">Email Address</label>
           <input id="recoverEmail" type="email" placeholder="user@example.com" class="w-full bg-gray-950 border border-gray-800 rounded p-2 text-sm">
@@ -380,7 +388,7 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
-  <!-- PLATFORM HEADER -->
+  <!-- PLATFORM HEADER NAVBAR -->
   <header class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex justify-between items-center">
     <div class="flex items-center gap-6">
       <h1 class="text-xl font-black text-red-500 tracking-wider">DERIV <span class="text-white text-xs font-normal">SYNTHETICS ENGINE</span></h1>
@@ -413,10 +421,10 @@ app.get('/', (req, res) => {
     </div>
   </header>
 
-  <!-- TRADING DASHBOARD LAYOUT -->
+  <!-- TRADING DASHBOARD WORKSPACE -->
   <div class="grid grid-cols-12 h-[calc(100vh-57px)]">
     
-    <!-- LEFT: CHART AND DIGIT CURSOR DISPLAY (8 COLS) -->
+    <!-- LEFT PANEL: CHART AND DIGIT CURSOR -->
     <div class="col-span-8 p-4 flex flex-col justify-between border-r border-gray-800">
       <div class="flex justify-between items-center mb-2">
         <div>
@@ -426,7 +434,7 @@ app.get('/', (req, res) => {
         <div class="text-3xl font-black text-green-400" id="livePriceDisplay">0000.00</div>
       </div>
 
-      <!-- Live Price Chart -->
+      <!-- Live Interactive Line Chart -->
       <div id="chartContainer" class="w-full flex-1 bg-gray-900 rounded-lg border border-gray-800 my-2"></div>
 
       <!-- Circular Last-Digit Cursor Indicator -->
@@ -436,23 +444,21 @@ app.get('/', (req, res) => {
           <p class="text-2xl font-black text-blue-400" id="currentDigitDisplay">0</p>
         </div>
         
-        <!-- Digit Ring -->
-        <div class="digit-circle" id="digitCircleRing">
-          <!-- Digits 0 to 9 positioned via JS -->
-        </div>
+        <!-- Digit Ring Component -->
+        <div class="digit-circle" id="digitCircleRing"></div>
       </div>
     </div>
 
-    <!-- RIGHT: CONTROL PANEL & AUTOMATION ENGINE (4 COLS) -->
+    <!-- RIGHT PANEL: CONTROL PANEL & BOT ENGINE -->
     <div class="col-span-4 bg-gray-900 p-4 flex flex-col justify-between">
       <div>
-        <!-- Mode Switcher -->
+        <!-- Mode Navigation -->
         <div class="flex border-b border-gray-800 pb-3 mb-4">
           <button onclick="setTradeMode('MANUAL')" id="manualTabBtn" class="flex-1 py-1.5 font-bold text-xs text-center border-b-2 border-red-500 text-white">MANUAL TRADING</button>
           <button onclick="setTradeMode('AUTO')" id="autoTabBtn" class="flex-1 py-1.5 font-bold text-xs text-center border-b-2 border-transparent text-gray-500">AUTO-BOT TRADER</button>
         </div>
 
-        <!-- Trade Controls -->
+        <!-- Trade Configuration -->
         <div class="space-y-4">
           <div>
             <label class="block text-xs text-gray-400 mb-1">Contract Type</label>
@@ -480,7 +486,7 @@ app.get('/', (req, res) => {
             </div>
           </div>
 
-          <!-- Execution Buttons -->
+          <!-- Trade Action Trigger Buttons -->
           <div id="manualExecutionBox" class="pt-2">
             <button onclick="executeTrade()" class="w-full bg-red-600 hover:bg-red-500 py-3 rounded font-black text-sm uppercase tracking-wider">Purchase Trade</button>
           </div>
@@ -491,7 +497,7 @@ app.get('/', (req, res) => {
         </div>
       </div>
 
-      <!-- Live Position & Settle Log -->
+      <!-- Trade Log Stream -->
       <div class="mt-4 border-t border-gray-800 pt-3 flex-1 flex flex-col justify-end">
         <h3 class="text-xs font-bold text-gray-400 uppercase mb-2">Trade History Log</h3>
         <div id="tradesLog" class="space-y-2 max-h-48 overflow-y-auto"></div>
@@ -539,7 +545,7 @@ app.get('/', (req, res) => {
       ring.appendChild(node);
     }
 
-    // Lightweight Chart Initialization
+    // Chart Setup
     const chartContainer = document.getElementById('chartContainer');
     const chart = LightweightCharts.createChart(chartContainer, {
       layout: { backgroundColor: '#030712', textColor: '#9ca3af' },
@@ -553,7 +559,7 @@ app.get('/', (req, res) => {
     });
     chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight });
 
-    // WebSocket Client
+    // WebSocket Engine Client
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(\`\${protocol}//\${window.location.host}\`);
 
@@ -566,7 +572,7 @@ app.get('/', (req, res) => {
           document.getElementById('livePriceDisplay').innerText = m.price.toFixed(2);
           lineSeries.update({ time: Math.floor(Date.now() / 1000), value: m.price });
 
-          // Update Circular Digit Ring
+          // Active Digit Cursor Ring Update
           const lastDigit = parseInt(m.price.toFixed(2).slice(-1), 10);
           document.getElementById('currentDigitDisplay').innerText = lastDigit;
           
@@ -583,32 +589,55 @@ app.get('/', (req, res) => {
       }
     };
 
-    // Auth Modal Logic
+    // FIXED Authentication Switcher Logic
     function toggleAuthMode() {
-      authMode = authMode === 'LOGIN' ? 'REGISTER' : 'LOGIN';
-      document.getElementById('authTitle').innerText = authMode === 'LOGIN' ? 'DERIV LOGIN' : 'CREATE DERIV ACCOUNT';
-      document.getElementById('authSubmitBtn').innerText = authMode === 'LOGIN' ? 'Log In' : 'Register Account';
-      document.getElementById('authToggleBtn').innerText = authMode === 'LOGIN' ? 'Need an account? Register' : 'Already registered? Login';
+      authMode = (authMode === 'LOGIN') ? 'REGISTER' : 'LOGIN';
+      
+      const title = document.getElementById('authTitle');
+      const submitBtn = document.getElementById('authSubmitBtn');
+      const toggleBtn = document.getElementById('authToggleBtn');
+
+      if (authMode === 'REGISTER') {
+        title.innerText = 'CREATE DERIV ACCOUNT';
+        submitBtn.innerText = 'Register Account';
+        toggleBtn.innerText = 'Already have an account? Login';
+      } else {
+        title.innerText = 'DERIV LOGIN';
+        submitBtn.innerText = 'Log In';
+        toggleBtn.innerText = 'Need an account? Register';
+      }
     }
 
-    async function submitAuth(mode) {
-      const email = document.getElementById('authEmail').value;
-      const password = document.getElementById('authPassword').value;
-      const endpoint = (mode || authMode) === 'LOGIN' ? '/api/auth/login' : '/api/auth/register';
+    async function submitAuth() {
+      const email = document.getElementById('authEmail').value.trim();
+      const password = document.getElementById('authPassword').value.trim();
 
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password })
-      });
+      if (!email || !password) {
+        return alert("Please enter both an email address and a password.");
+      }
 
-      const data = await res.json();
-      if (data.error) return alert(data.error);
+      // Explicit Endpoint Routing Fix
+      const endpoint = (authMode === 'REGISTER') ? '/api/auth/register' : '/api/auth/login';
 
-      currentUser = data.user;
-      document.getElementById('userEmailDisplay').innerText = currentUser.email;
-      document.getElementById('balanceDisplay').innerText = '$' + currentUser.balance.toFixed(2);
-      document.getElementById('authModal').classList.add('hidden');
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+
+        const data = await res.json();
+        if (data.error) return alert(data.error);
+
+        currentUser = data.user;
+        document.getElementById('userEmailDisplay').innerText = currentUser.email;
+        document.getElementById('balanceDisplay').innerText = '$' + currentUser.balance.toFixed(2);
+        document.getElementById('authModal').classList.add('hidden');
+        
+        alert(authMode === 'REGISTER' ? "Account created successfully! $1,000 demo balance added." : "Welcome back!");
+      } catch (err) {
+        alert("Connection error. Please try again.");
+      }
     }
 
     function showRecoveryForm() {
@@ -652,7 +681,7 @@ app.get('/', (req, res) => {
       hideRecoveryForm();
     }
 
-    // AI Deep Scanner
+    // AI Deep Scanner Handler
     async function runAiScan() {
       const res = await fetch('/api/ai/deep-scan');
       const data = await res.json();
@@ -663,7 +692,7 @@ app.get('/', (req, res) => {
       }
     }
 
-    // Trading Controls
+    // Market and Contract Handlers
     function changeMarket() {
       activeSymbol = document.getElementById('marketSelect').value;
       const title = document.getElementById('marketSelect').options[document.getElementById('marketSelect').selectedIndex].text;
@@ -695,7 +724,7 @@ app.get('/', (req, res) => {
     }
 
     async function executeTrade() {
-      if (!currentUser) return alert("Please log in to trade.");
+      if (!currentUser) return alert("Please create an account or log in first.");
 
       const payload = {
         userId: currentUser.id,
@@ -750,7 +779,7 @@ app.get('/', (req, res) => {
       log.prepend(item);
     }
 
-    // Wallet Operations
+    // Wallet Action Handlers
     function openWalletModal(action) {
       activeWalletAction = action;
       document.getElementById('walletModalTitle').innerText = action === 'DEPOSIT' ? 'Deposit Funds' : 'Withdraw Funds';
@@ -788,5 +817,5 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Deriv Clone Engine running on port ${PORT}`);
+  console.log(`Deriv Engine live on port ${PORT}`);
 });
