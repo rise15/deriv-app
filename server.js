@@ -17,7 +17,6 @@ const MPESA_CONFIG = {
   consumerSecret: "YOUR_CONSUMER_SECRET", // Replace with Daraja Consumer Secret
   passkey: "YOUR_LIPA_NA_MPESA_PASSKEY",  // Replace with Daraja Passkey
   shortCode: "174379",                   // Sandbox Paybill/Till (or live Shortcode)
-  recipientPhone: "254703606219",         // Raphael Mugambi (0703606219)
   callbackUrl: "https://your-domain.com/api/wallet/mpesa-callback", // Public HTTPS URL
   env: "sandbox"                          // "sandbox" or "production"
 };
@@ -337,16 +336,15 @@ app.post('/api/wallet/stk-push', async (req, res) => {
       ? 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
       : 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
-    // PartyB is set to MPESA_CONFIG.recipientPhone (254703606219 - Raphael Mugambi)
     const stkPayload = {
       BusinessShortCode: MPESA_CONFIG.shortCode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline', // Change to 'CustomerBuyGoodsOnline' if using Till Number
+      TransactionType: 'CustomerPayBillOnline',
       Amount: numAmount,
-      PartyA: user.mobile,                             // User's Phone Number (Payer)
-      PartyB: MPESA_CONFIG.recipientPhone,             // 254703606219 - Raphael Mugambi (Recipient)
-      PhoneNumber: user.mobile,                        // Phone receiving the STK prompt
+      PartyA: user.mobile,
+      PartyB: MPESA_CONFIG.shortCode,
+      PhoneNumber: user.mobile,
       CallBackURL: MPESA_CONFIG.callbackUrl,
       AccountReference: user.id,
       TransactionDesc: 'TraderScheme Deposit'
@@ -359,7 +357,7 @@ app.post('/api/wallet/stk-push', async (req, res) => {
     if (response.data.ResponseCode === "0") {
       res.json({
         success: true,
-        message: `STK Push prompt sent to ${user.mobile}. Please enter your M-Pesa PIN on your phone to send funds to Raphael Mugambi.`
+        message: `STK Push prompt sent to ${user.mobile}. Please enter your M-Pesa PIN on your phone.`
       });
     } else {
       res.status(400).json({ error: "Failed to trigger STK Push prompt." });
